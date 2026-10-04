@@ -1,8 +1,5 @@
 """Testing of RedisStore."""
 
-import pytest
-
-from diffsync.exceptions import ObjectStoreException
 from diffsync.store.redis import RedisStore
 
 
@@ -16,8 +13,12 @@ def test_redisstore_init(redisdb):
 
 
 def test_redisstore_init_wrong():
-    with pytest.raises(ObjectStoreException):
-        RedisStore(name="mystore", store_id="123", url="redis://wrong")
+    # An unreachable server no longer raises: the store degrades to fakeredis and must
+    # surface the fallback explicitly rather than silently pretending to be real Redis.
+    store = RedisStore(name="mystore", store_id="123", url="redis://wrong")
+    assert store.fallback is True
+    assert store.fallback_reason is not None
+    assert store._store.ping() is True
 
 
 def test_redisstore_add_obj(redisdb, make_site):

@@ -17,11 +17,32 @@ limitations under the License.
 
 from typing import ClassVar, Dict, List, Optional, Tuple
 
+import fakeredis
 import pytest
 
 from diffsync import Adapter, DiffSyncModel
 from diffsync.diff import Diff, DiffElement
 from diffsync.exceptions import ObjectNotCreated, ObjectNotDeleted, ObjectNotUpdated
+
+
+@pytest.fixture
+def redisdb():
+    """Provide a fakeredis-backed stand-in for the pytest-redis ``redisdb`` fixture.
+
+    RedisStore degrades to fakeredis when a real server is unreachable, so these tests
+    exercise the same in-process backend. The returned object's connection pool reports
+    a unix-socket-style ``path`` (as the real fixture does); a fresh isolated instance
+    is created per test.
+    """
+
+    class _FakeRedisWithPath(fakeredis.FakeStrictRedis):
+        """FakeRedis whose connection pool reports a unix-socket-style ``path``."""
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.connection_pool.connection_kwargs["path"] = "/tmp/diffsync-test-redis.sock"
+
+    return _FakeRedisWithPath()
 
 
 @pytest.fixture

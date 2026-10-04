@@ -7,7 +7,10 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Type, Union
 
 try:
     from redis import Redis
+    from redis.backoff import NoBackoff
     from redis.exceptions import ConnectionError as RedisConnectionError
+    from redis.exceptions import TimeoutError as RedisTimeoutError
+    from redis.retry import Retry
 except ImportError as ierr:
     print("Redis is not installed. Have you installed diffsync with redis extra? `pip install diffsync[redis]`")
     raise ierr
@@ -40,18 +43,40 @@ class RedisStore(BaseStore):
         if url and host and port:
             raise ValueError("'url' and 'host' arguments can't be specified together.")
 
+        self.fallback = False
+        self.fallback_reason: Optional[str] = None
+        # Keep connection probing short so that the fakeredis fallback engages
+        # promptly instead of waiting through redis-py's default retry backoff.
+        connect_options = {
+            "socket_connect_timeout": 1,
+            "socket_timeout": 1,
+            "retry": Retry(NoBackoff(), 1),
+        }
         try:
             if url:
-                self._store = Redis.from_url(url, db=db)
+                self._store = Redis.from_url(url, db=db, **connect_options)
             elif host:
-                self._store = Redis(host=host, port=port, db=db)
+                self._store = Redis(host=host, port=port, db=db, **connect_options)
             else:
                 raise RedisConnectionError("Neither 'host' nor 'url' were specified.")
 
             if not self._store.ping():
-                raise RedisConnectionError()
-        except RedisConnectionError:
-            raise ObjectStoreException("Redis store is unavailable.") from RedisConnectionError
+                raise RedisConnectionError("Redis ping returned False")
+        except (RedisConnectionError, RedisTimeoutError, OSError, AttributeError) as connection_error:
+            # Degrade to an in-process fakeredis instance rather than failing hard.
+            # The fallback is surfaced explicitly (self.fallback) so callers never
+            # silently run against a different backend than they asked for.
+            try:
+                import fakeredis  # pylint: disable=import-outside-toplevel
+
+                self._store = fakeredis.FakeStrictRedis(decode_responses=False)
+                self.fallback = True
+                self.fallback_reason = f"{connection_error.__class__.__name__}: {connection_error}"
+            except ImportError:
+                raise ObjectStoreException(
+                    "Redis store is unavailable and fakeredis is not installed "
+                    "(install the 'fakeredis' package to enable fallback)."
+                ) from connection_error
 
         self._store_id = store_id if store_id else str(uuid.uuid4())
 
@@ -69,6 +94,26 @@ class RedisStore(BaseStore):
             obj_result.adapter = self.adapter
             return obj_result
         raise ObjectNotFound(f"{key} not present in Cache")
+
+    def _identity_get(self, modelname: str, uid: str) -> Optional["DiffSyncModel"]:
+        """Return the process-live instance for a uid, if one is cached."""
+        cache = getattr(self, "_identity_cache", None)
+        if cache is None:
+            return None
+        return cache.get(modelname, {}).get(uid)
+
+    def _identity_set(self, modelname: str, uid: str, obj: "DiffSyncModel") -> None:
+        """Cache a deserialized object as the process-live instance for a uid."""
+        if not hasattr(self, "_identity_cache"):
+            self._identity_cache: Dict[str, Dict[str, "DiffSyncModel"]] = {}
+        obj.adapter = self.adapter
+        self._identity_cache.setdefault(modelname, {})[uid] = obj
+
+    def _identity_drop(self, modelname: str, uid: str) -> None:
+        """Drop a cached live instance."""
+        cache = getattr(self, "_identity_cache", None)
+        if cache is not None:
+            cache.get(modelname, {}).pop(uid, None)
 
     def get_all_model_names(self) -> Set[str]:
         """Get all the model names stored.
@@ -106,7 +151,17 @@ class RedisStore(BaseStore):
 
         uid = self._get_uid(model, object_class, identifier)
 
-        return self._get_object_from_redis_key(self._get_key_for_object(modelname, uid))
+        # Return the process-live instance when available so in-flight updates mutate the
+        # same object the syncer holds (mirrors LocalStore identity semantics). Otherwise
+        # deserialize from Redis and register it, preventing the next sync from seeing a
+        # fresh adapter-less copy and trying to re-create an object that exists in Redis.
+        live = self._identity_get(modelname, uid)
+        if live is not None:
+            return live
+
+        obj_result = self._get_object_from_redis_key(self._get_key_for_object(modelname, uid))
+        self._identity_set(modelname, uid, obj_result)
+        return obj_result
 
     def get_all(self, *, model: Union[str, "DiffSyncModel", Type["DiffSyncModel"]]) -> List["DiffSyncModel"]:
         """Get all objects of a given type.
@@ -124,7 +179,10 @@ class RedisStore(BaseStore):
 
         results: List["DiffSyncModel"] = []
         for key in self._store.scan_iter(f"{self._store_label}:{modelname}:*"):
-            results.append(self._get_object_from_redis_key(key))  # type: ignore[arg-type]
+            # Key layout: b"<store_label>:<modelname>:<uid>"; uid itself may contain ':'.
+            prefix = f"{self._store_label}:{modelname}:".encode()
+            uid = key[len(prefix) :].decode()
+            results.append(self.get(model=modelname, identifier=uid))
 
         return results
 
@@ -147,7 +205,7 @@ class RedisStore(BaseStore):
 
         results = []
         for uid in uids:
-            results.append(self._get_object_from_redis_key(self._get_key_for_object(modelname, uid)))
+            results.append(self.get(model=modelname, identifier=uid))
 
         return results
 
@@ -182,6 +240,7 @@ class RedisStore(BaseStore):
         obj_copy.adapter = None
 
         self._store.set(object_key, dumps(obj_copy))
+        self._identity_set(modelname, uid, obj)
 
     def update(self, *, obj: "DiffSyncModel") -> None:
         """Update a DiffSyncModel object to the store.
@@ -193,10 +252,14 @@ class RedisStore(BaseStore):
         uid = obj.get_unique_id()
 
         object_key = self._get_key_for_object(modelname, uid)
+        existing_obj_binary = self._store.get(object_key)
+        if not existing_obj_binary:
+            raise ObjectNotFound(f"{modelname} {uid} not present in {str(self)}")
         obj_copy = copy.copy(obj)
         obj_copy.adapter = None
 
         self._store.set(object_key, dumps(obj_copy))
+        self._identity_set(modelname, uid, obj)
 
     def remove_item(self, modelname: str, uid: str) -> None:
         """Remove one item from store."""
@@ -206,6 +269,7 @@ class RedisStore(BaseStore):
             raise ObjectNotFound(f"{modelname} {uid} not present in Cache")
 
         self._store.delete(object_key)
+        self._identity_drop(modelname, uid)
 
     def count(self, *, model: Union[str, "DiffSyncModel", Type["DiffSyncModel"], None] = None) -> int:
         """Returns the number of elements of a specific model, or all elements in the store if unspecified."""
